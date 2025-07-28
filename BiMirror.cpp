@@ -230,7 +230,7 @@ public:
 
    void loadImage(const std::string& filepath) {
       try {
-         original_image = cv::imread(filepath, cv::IMREAD_COLOR);
+         original_image = cv::imread(filepath, cv::IMREAD_ANYCOLOR);
          if (original_image.empty()) {
             throw std::runtime_error("Impossibile caricare l'immagine: " + filepath);
          }
@@ -241,6 +241,15 @@ public:
          roiLente.y = 50;
          roiLente.width = 700;
          roiLente.height = 600;
+         //roiLente.x = 50;
+         //roiLente.y = 10;
+         //roiLente.width = 7000;
+         //roiLente.height = 6000;
+
+         if(roiLente.x + roiLente.width > processed_image.cols)
+				roiLente.width = processed_image.cols - roiLente.x - 1;
+         if (roiLente.y + roiLente.height > processed_image.rows)
+            roiLente.height = processed_image.rows - roiLente.y - 1;
 
          if (roiLente.x + roiLente.width > processed_image.cols ||
             roiLente.y + roiLente.height > processed_image.rows) {
@@ -262,7 +271,7 @@ public:
          std::vector<cv::Vec3f> circles;
          cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1,
             roi_image.rows / 4,
-            70, 5,
+            50, 12,     // 50, 5 era prima         50,11
             roi_image.rows / 4,
             roi_image.rows / 2);
 
@@ -680,8 +689,8 @@ public:
          std::cout << "   Asse centrale calcolato con successo!" << std::endl;
 
          // Analisi della posizione reale della banda
-         std::cout << "\n3.5 Analisi posizione reale della banda chiara..." << std::endl;
-         band_analysis = analyzeBandPosition();
+         //std::cout << "\n3.5 Analisi posizione reale della banda chiara..." << std::endl;
+         //band_analysis = analyzeBandPosition();
 
          std::cout << "\n4. Generazione grafici di analisi..." << std::endl;
          createAnalysisGraphs(results);
@@ -698,15 +707,72 @@ public:
          cv::Mat display;
          original_image.copyTo(display);
 
-         // Visualizzazioni esistenti
-         cv::rectangle(display, roiLente, cv::Scalar(255, 255, 0), 2);
-         cv::circle(display, lens_center_global, static_cast<int>(lens_radius), cv::Scalar(0, 255, 0), 2);
+         // Calcola il fattore di scala ottimale per la visualizzazione
+         double scale_factor = 0.5;
+         const int max_display_width = 1200;   // Larghezza massima desiderata
+         const int max_display_height = 800;   // Altezza massima desiderata
+
+         // Calcola il fattore di scala necessario
+         double scale_x = 1.0;
+         double scale_y = 1.0;
+
+         if (display.cols > max_display_width) {
+            scale_x = static_cast<double>(max_display_width) / display.cols;
+         }
+         if (display.rows > max_display_height) {
+            scale_y = static_cast<double>(max_display_height) / display.rows;
+         }
+
+         // Usa il fattore di scala minore per mantenere le proporzioni
+         scale_factor = std::min(scale_x, scale_y);
+
+         // Applica lo zoom solo se necessario
+         cv::Mat display_scaled;
+         cv::Mat display_for_drawing;
+
+         if (scale_factor < 1.0) {
+            // Ridimensiona l'immagine
+            cv::resize(display, display_scaled, cv::Size(), scale_factor, scale_factor, cv::INTER_LINEAR);
+            display_for_drawing = display_scaled;
+
+            std::cout << "Immagine ridimensionata con fattore: " << scale_factor
+               << " (da " << display.cols << "x" << display.rows
+               << " a " << display_scaled.cols << "x" << display_scaled.rows << ")" << std::endl;
+         }
+         else {
+            display_for_drawing = display;
+            std::cout << "Nessun ridimensionamento necessario" << std::endl;
+         }
+
+         // Scala tutti i punti e le coordinate per il disegno
+         cv::Rect roiLente_scaled(
+            static_cast<int>(roiLente.x * scale_factor),
+            static_cast<int>(roiLente.y * scale_factor),
+            static_cast<int>(roiLente.width * scale_factor),
+            static_cast<int>(roiLente.height * scale_factor)
+         );
+
+         cv::Point lens_center_global_scaled(
+            static_cast<int>(lens_center_global.x * scale_factor),
+            static_cast<int>(lens_center_global.y * scale_factor)
+         );
+
+         int lens_radius_scaled = static_cast<int>(lens_radius * scale_factor);
+
+         // Disegna gli elementi scalati
+         cv::rectangle(display_for_drawing, roiLente_scaled, cv::Scalar(255, 255, 0), 2);
+         cv::circle(display_for_drawing, lens_center_global_scaled, lens_radius_scaled, cv::Scalar(0, 255, 0), 2);
 
          // Linea teorica (passante per il centro) - in rosso
-         cv::line(display,
-            cv::Point(static_cast<int>(axis_line_global[0]), static_cast<int>(axis_line_global[1])),
-            cv::Point(static_cast<int>(axis_line_global[2]), static_cast<int>(axis_line_global[3])),
-            cv::Scalar(0, 0, 255), 2);
+         cv::Point p1_teorica(
+            static_cast<int>(axis_line_global[0] * scale_factor),
+            static_cast<int>(axis_line_global[1] * scale_factor)
+         );
+         cv::Point p2_teorica(
+            static_cast<int>(axis_line_global[2] * scale_factor),
+            static_cast<int>(axis_line_global[3] * scale_factor)
+         );
+         cv::line(display_for_drawing, p1_teorica, p2_teorica, cv::Scalar(0, 0, 255), 2);
 
          // Linea reale della banda - in blu
          cv::Point2f p1_roi(band_analysis.fitted_line[0], band_analysis.fitted_line[1]);
@@ -714,39 +780,56 @@ public:
          cv::Point2f p1_global = roiToGlobal(p1_roi);
          cv::Point2f p2_global = roiToGlobal(p2_roi);
 
-         cv::line(display,
-            cv::Point(static_cast<int>(p1_global.x), static_cast<int>(p1_global.y)),
-            cv::Point(static_cast<int>(p2_global.x), static_cast<int>(p2_global.y)),
-            cv::Scalar(255, 0, 0), 2);
+         cv::Point p1_banda(
+            static_cast<int>(p1_global.x * scale_factor),
+            static_cast<int>(p1_global.y * scale_factor)
+         );
+         cv::Point p2_banda(
+            static_cast<int>(p2_global.x * scale_factor),
+            static_cast<int>(p2_global.y * scale_factor)
+         );
+         cv::line(display_for_drawing, p1_banda, p2_banda, cv::Scalar(255, 0, 0), 2);
 
          // Linea di distanza minima - in verde
-         cv::Point2f closest_global = roiToGlobal(band_analysis.closest_point);
-         cv::line(display,
-            cv::Point(static_cast<int>(lens_center_global.x), static_cast<int>(lens_center_global.y)),
-            cv::Point(static_cast<int>(closest_global.x), static_cast<int>(closest_global.y)),
-            cv::Scalar(0, 255, 0), 1);
+         //cv::Point2f closest_global = roiToGlobal(band_analysis.closest_point);
+         //cv::Point closest_scaled(
+         //   static_cast<int>(closest_global.x * scale_factor),
+         //   static_cast<int>(closest_global.y * scale_factor)
+         //);
+         //cv::line(display_for_drawing, lens_center_global_scaled, closest_scaled, cv::Scalar(0, 255, 0), 1);
 
-         // Testi informativi
-         cv::putText(display, "ROI",
-            cv::Point(roiLente.x + 5, roiLente.y - 5),
-            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
+         // Testi informativi (con dimensione font adattata)
+         double font_scale = std::max(0.5, 0.7 * scale_factor);
+         int font_thickness = std::max(1, static_cast<int>(2 * scale_factor));
 
-         cv::putText(display, "Linea Teorica (rosso) vs Reale (blu)",
+         cv::putText(display_for_drawing, "ROI",
+            cv::Point(roiLente_scaled.x + 5, roiLente_scaled.y - 5),
+            cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 0), font_thickness);
+
+         cv::putText(display_for_drawing, "Linea Teorica (rosso)",
             cv::Point(50, 50),
-            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2);
+            cv::FONT_HERSHEY_SIMPLEX, font_scale * 1.2, cv::Scalar(255, 255, 255), font_thickness);
 
          std::string angle_text = "Angolo: " + std::to_string(normalizzaAngolo(optimal_angle)) + " gradi";
-         cv::putText(display, angle_text,
+         cv::putText(display_for_drawing, angle_text,
             cv::Point(50, 80),
-            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+            cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 255), font_thickness);
 
-         std::string distance_text = "Distanza dal centro: " +
-            std::to_string(static_cast<int>(band_analysis.distance)) + " pixel";
-         cv::putText(display, distance_text,
-            cv::Point(50, 110),
-            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+         //std::string distance_text = "Distanza dal centro: " +
+         //   std::to_string(static_cast<int>(band_analysis.distance)) + " pixel";
+         //cv::putText(display_for_drawing, distance_text,
+         //   cv::Point(50, 110),
+         //   cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(0, 255, 0), font_thickness);
 
-         cv::imshow(window_name, display);
+         // Aggiungi informazioni sul fattore di scala se l'immagine è stata ridimensionata
+         if (scale_factor < 1.0) {
+            std::string scale_text = "Zoom: " + std::to_string(static_cast<int>(scale_factor * 100)) + "%";
+            cv::putText(display_for_drawing, scale_text,
+               cv::Point(50, 140),
+               cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 0), font_thickness);
+         }
+
+         cv::imshow(window_name, display_for_drawing);
          cv::waitKey(0);
 
       }
@@ -754,7 +837,6 @@ public:
          throw std::runtime_error("Errore nella visualizzazione: " + std::string(e.what()));
       }
    }
-
    void saveResults(const std::string& output_path) {
       try {
          cv::Mat output;
@@ -1003,6 +1085,7 @@ int main(int argc, char** argv) {
 #endif
 
       std::string nomeFileImg = "imgBiDeg.png";
+      //std::string nomeFileImg = "Bi_IRconFiltro.png";
       BiMirrorLensAnalyzer::EvaluationMetric metrica = BiMirrorLensAnalyzer::EvaluationMetric::INTEGRAL_VALUE;
 
       // Parsing argomenti
