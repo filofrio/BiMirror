@@ -689,8 +689,8 @@ public:
          std::cout << "   Asse centrale calcolato con successo!" << std::endl;
 
          // Analisi della posizione reale della banda
-         //std::cout << "\n3.5 Analisi posizione reale della banda chiara..." << std::endl;
-         //band_analysis = analyzeBandPosition();
+         std::cout << "\n3.5 Analisi posizione reale della banda chiara..." << std::endl;
+         band_analysis = analyzeBandPosition();
 
          std::cout << "\n4. Generazione grafici di analisi..." << std::endl;
          createAnalysisGraphs(results);
@@ -791,12 +791,12 @@ public:
          cv::line(display_for_drawing, p1_banda, p2_banda, cv::Scalar(255, 0, 0), 2);
 
          // Linea di distanza minima - in verde
-         //cv::Point2f closest_global = roiToGlobal(band_analysis.closest_point);
-         //cv::Point closest_scaled(
-         //   static_cast<int>(closest_global.x * scale_factor),
-         //   static_cast<int>(closest_global.y * scale_factor)
-         //);
-         //cv::line(display_for_drawing, lens_center_global_scaled, closest_scaled, cv::Scalar(0, 255, 0), 1);
+         cv::Point2f closest_global = roiToGlobal(band_analysis.closest_point);
+         cv::Point closest_scaled(
+            static_cast<int>(closest_global.x * scale_factor),
+            static_cast<int>(closest_global.y * scale_factor)
+         );
+         cv::line(display_for_drawing, lens_center_global_scaled, closest_scaled, cv::Scalar(0, 255, 0), 1);
 
          // Testi informativi (con dimensione font adattata)
          double font_scale = std::max(0.5, 0.7 * scale_factor);
@@ -807,27 +807,46 @@ public:
             cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 0), font_thickness);
 
          cv::putText(display_for_drawing, "Linea Teorica (rosso)",
-            cv::Point(50, 50),
+            cv::Point(10, 50),
             cv::FONT_HERSHEY_SIMPLEX, font_scale * 1.2, cv::Scalar(255, 255, 255), font_thickness);
 
          std::string angle_text = "Angolo: " + std::to_string(normalizzaAngolo(optimal_angle)) + " gradi";
          cv::putText(display_for_drawing, angle_text,
-            cv::Point(50, 80),
+            cv::Point(10, 80),
             cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 255), font_thickness);
 
-         //std::string distance_text = "Distanza dal centro: " +
-         //   std::to_string(static_cast<int>(band_analysis.distance)) + " pixel";
-         //cv::putText(display_for_drawing, distance_text,
-         //   cv::Point(50, 110),
-         //   cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(0, 255, 0), font_thickness);
+         std::string distance_text = "Distanza dal centro: " +
+            std::to_string(static_cast<float>(band_analysis.distance)) + " pixel";
+         cv::putText(display_for_drawing, distance_text,
+            cv::Point(10, 110),
+            cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(0, 255, 0), font_thickness);
 
          // Aggiungi informazioni sul fattore di scala se l'immagine è stata ridimensionata
          if (scale_factor < 1.0) {
             std::string scale_text = "Zoom: " + std::to_string(static_cast<int>(scale_factor * 100)) + "%";
             cv::putText(display_for_drawing, scale_text,
-               cv::Point(50, 140),
+               cv::Point(10, 140),
                cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 0), font_thickness);
          }
+
+         // Grafica per analyzeBandPosition
+         // Cerchietto sul punto più vicino per evidenziarlo
+         cv::circle(display_for_drawing, closest_scaled, 5, cv::Scalar(0, 255, 0), -1);
+
+         // Aggiungi testo per indicare la posizione della banda
+         std::string position_text = "Banda: " +
+            std::string(band_analysis.closest_point.y < lens_center.y ? "SOPRA" : "SOTTO") +
+            " il centro";
+         cv::putText(display_for_drawing, position_text,
+            cv::Point(10, 170),
+            cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 0), font_thickness);
+
+         // Offset percentuale
+         double offset_percent = (band_analysis.distance / lens_radius) * 100.0;
+         std::string offset_text = "Offset % rispetto al centro lente: " + cv::format("%.1f%%", offset_percent);
+         cv::putText(display_for_drawing, offset_text,
+            cv::Point(10, 200),
+            cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 0), font_thickness);
 
          cv::imshow(window_name, display_for_drawing);
          cv::waitKey(0);
@@ -978,9 +997,8 @@ public:
       }
    }
 
-   // Nuovo metodo principale per analizzare la posizione della banda
    BandLineResult analyzeBandPosition() {
-      std::cout << "\nAnalisi posizione reale della banda chiara..." << std::endl;
+      std::cout << "\nAnalisi posizione banda chiara centrata..." << std::endl;
 
       // Usa l'angolo ottimale già trovato
       auto [sin_val, cos_val] = trig_lut.getSinCos(optimal_angle);
@@ -991,63 +1009,83 @@ public:
       cv::warpAffine(roi_image, rotated, rotation_matrix, roi_image.size());
       cv::warpAffine(lens_mask, rotated_mask, rotation_matrix, lens_mask.size());
 
-      // Trova i punti di massima intensità per ogni colonna
-      std::vector<cv::Point2f> band_points;
+      // Dopo la rotazione ottimale, la banda chiara è orizzontale
+      // Riutilizziamo la stessa logica di analyzeRotationProfile per trovare la posizione esatta
 
-      int start_x = std::max(0, static_cast<int>(lens_center.x - lens_radius));
-      int end_x = std::min(rotated.cols, static_cast<int>(lens_center.x + lens_radius));
+      int start_y = std::max(0, static_cast<int>(lens_center.y - lens_radius));
+      int end_y = std::min(rotated.rows, static_cast<int>(lens_center.y + lens_radius));
+      int num_rows = end_y - start_y;
 
-		for (int x = start_x; x < end_x; x += 1) { // per cambiare il passo di campionamento modifica x+= 1
-         // Determina il range y per questa colonna
-         double dx = x - lens_center.x;
-         double max_dy = std::sqrt(lens_radius * lens_radius - dx * dx);
+      std::vector<double> row_profile(num_rows);
+      std::vector<int> positions(num_rows);
 
-         int y_start = std::max(0, static_cast<int>(lens_center.y - max_dy));
-         int y_end = std::min(rotated.rows, static_cast<int>(lens_center.y + max_dy));
+      // Calcola il profilo per righe (integrale lungo X per ogni Y)
+      for (int idx = 0; idx < num_rows; idx++) {
+         int y = start_y + idx;
+         double row_sum = 0;
+         int pixel_count = 0;
 
-         // Trova il picco di intensità in questa colonna
-         int max_intensity = 0;
-         int best_y = -1;
-
-         for (int y = y_start; y < y_end; y++) {
+         for (int x = 0; x < rotated.cols; x++) {
             if (rotated_mask.at<uchar>(y, x) > 0) {
-               int intensity = rotated.at<uchar>(y, x);
-               if (intensity > max_intensity) {
-                  max_intensity = intensity;
-                  best_y = y;
-               }
+               row_sum += rotated.at<uchar>(y, x);
+               pixel_count++;
             }
          }
 
-         if (best_y != -1 && max_intensity > 100) { // Soglia minima di intensità
-            band_points.push_back(cv::Point2f(static_cast<float>(x), static_cast<float>(best_y)));
+         if (pixel_count > 0) {
+            row_profile[idx] = row_sum / pixel_count;
+            positions[idx] = y;
+         }
+         else {
+            row_profile[idx] = 0;
+            positions[idx] = y;
          }
       }
 
-      if (band_points.size() < 10) {
-         throw std::runtime_error("Punti insufficienti per determinare la banda chiara");
+      // Trova il massimo nel profilo
+      int max_idx = -1;
+      double max_value = 0;
+
+      for (int i = 0; i < num_rows; i++) {
+         if (row_profile[i] > max_value) {
+            max_value = row_profile[i];
+            max_idx = i;
+         }
       }
 
-      // Esegui la regressione lineare
-      BandLineResult result = performLinearRegression(band_points);
-      result.band_points = band_points;
-
-      // Calcola la distanza dal centro
-      cv::Point2d closest_point;
-      result.distance = pointToLineDistance(lens_center, result.slope, result.intercept, closest_point);
-      result.closest_point = closest_point;
-
-      // Crea la linea per la visualizzazione
-      if (std::isinf(result.slope)) {
-         // Linea verticale
-         result.fitted_line = cv::Vec4f(static_cast<float>(result.intercept), 0, static_cast<float>(result.intercept), static_cast<float>(rotated.rows));
+      if (max_idx == -1) {
+         throw std::runtime_error("Impossibile trovare la banda chiara");
       }
-      else {
-         // Calcola i punti estremi della linea
-         float y1 = static_cast<float>(result.slope * start_x + result.intercept);
-         float y2 = static_cast<float>(result.slope * end_x + result.intercept);
-         result.fitted_line = cv::Vec4f(static_cast<float>(start_x), y1, static_cast<float>(end_x), y2);
+
+      // Affina la posizione usando una media pesata intorno al picco
+      double weighted_sum = 0;
+      double weight_total = 0;
+      int window = 10; // finestra di ricerca intorno al picco
+
+      int start_window = std::max(0, max_idx - window);
+      int end_window = std::min(num_rows, max_idx + window + 1);
+
+      for (int i = start_window; i < end_window; i++) {
+         double weight = row_profile[i];
+         weighted_sum += positions[i] * weight;
+         weight_total += weight;
       }
+
+      double band_y_position = weighted_sum / weight_total;
+
+      // Crea il risultato
+      BandLineResult result;
+      result.slope = 0.0; // La banda è orizzontale dopo la rotazione ottimale
+      result.intercept = band_y_position;
+      result.distance = std::abs(band_y_position - lens_center.y);
+      result.closest_point = cv::Point2f(lens_center.x, static_cast<float>(band_y_position));
+      result.r_squared = 1.0; // Non è una regressione, ma un calcolo diretto
+
+      // Crea la linea orizzontale per la visualizzazione (nelle coordinate ruotate)
+      float x_start = lens_center.x - lens_radius;
+      float x_end = lens_center.x + lens_radius;
+      result.fitted_line = cv::Vec4f(x_start, static_cast<float>(band_y_position),
+         x_end, static_cast<float>(band_y_position));
 
       // Trasforma i risultati nelle coordinate originali (non ruotate)
       cv::Mat inv_rotation = cv::getRotationMatrix2D(lens_center, -optimal_angle, 1.0);
@@ -1066,15 +1104,20 @@ public:
       );
       result.closest_point = transformed_points[2];
 
+      // Calcola l'offset dalla posizione teorica centrata
+      double theoretical_center_y = lens_center.y;
+      double offset_from_center = band_y_position - theoretical_center_y;
+
       // Output dei risultati
-      std::cout << "   Punti banda rilevati: " << band_points.size() << std::endl;
-      std::cout << "   Qualità del fit (R²): " << result.r_squared << std::endl;
-      std::cout << "   Distanza dal centro: " << result.distance << " pixel" << std::endl;
-      std::cout << "   Posizione banda: " << (closest_point.y < lens_center.y ? "sopra" : "sotto") << " il centro" << std::endl;
+      std::cout << "   Posizione Y della banda (coordinate ruotate): " << band_y_position << std::endl;
+      std::cout << "   Centro teorico Y: " << theoretical_center_y << std::endl;
+      std::cout << "   Offset dal centro: " << offset_from_center << " pixel" << std::endl;
+      std::cout << "   Distanza assoluta dal centro: " << result.distance << " pixel" << std::endl;
+      std::cout << "   Posizione banda: " << (offset_from_center < 0 ? "sopra" : "sotto") << " il centro" << std::endl;
+      std::cout << "   Intensità massima trovata: " << max_value << std::endl;
 
       return result;
    }
-
 };
 
 int main(int argc, char** argv) {
