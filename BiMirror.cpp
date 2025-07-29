@@ -11,6 +11,7 @@
 #include <fstream>
 #include <algorithm>
 #include <chrono>
+#include <numeric>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -159,23 +160,7 @@ double normalizzaAngolo(double angolo) {
 }
 
 class BiMirrorLensAnalyzer {
-private:
-   cv::Rect roiLente;
-   cv::Mat original_image;
-   cv::Mat processed_image;
-   cv::Mat roi_image;
-   cv::Mat lens_mask;
-   cv::Point2f lens_center;
-   cv::Point2f lens_center_global;
-   float lens_radius;
-   double optimal_angle;
-   cv::Vec4f axis_line;
-   cv::Vec4f axis_line_global;
-   TrigonometricLUT trig_lut;
-   
-
 public:
-  
    // Enum per le metriche di valutazione
    enum class EvaluationMetric {
       INTEGRAL_VALUE = 0,    // Valore dell'integrale
@@ -207,6 +192,24 @@ public:
    };
 
    BandLineResult band_analysis;
+private:
+   cv::Rect roiLente;
+   cv::Mat original_image;
+   cv::Mat processed_image;
+   cv::Mat roi_image;
+   cv::Mat lens_mask;
+   cv::Point2f lens_center;
+   cv::Point2f lens_center_global;
+   float lens_radius;
+   double optimal_angle;
+   cv::Vec4f axis_line;
+   cv::Vec4f axis_line_global;
+   TrigonometricLUT trig_lut;
+   EvaluationMetric current_metric;  // Memorizza la metrica corrente
+
+public:
+  
+
 
    BiMirrorLensAnalyzer() : lens_radius(0), optimal_angle(0), trig_lut(0.5) {
 #ifdef _OPENMP
@@ -237,14 +240,14 @@ public:
 
          cv::cvtColor(original_image, processed_image, cv::COLOR_BGR2GRAY);
 
-         roiLente.x = 250;
-         roiLente.y = 50;
-         roiLente.width = 700;
-         roiLente.height = 600;
-         //roiLente.x = 50;
-         //roiLente.y = 10;
-         //roiLente.width = 7000;
-         //roiLente.height = 6000;
+         //roiLente.x = 250;
+         //roiLente.y = 50;
+         //roiLente.width = 700;
+         //roiLente.height = 600;
+         roiLente.x = 50;
+         roiLente.y = 10;
+         roiLente.width = 7000;
+         roiLente.height = 6000;
 
          if(roiLente.x + roiLente.width > processed_image.cols)
 				roiLente.width = processed_image.cols - roiLente.x - 1;
@@ -291,7 +294,7 @@ public:
          lens_center_global = roiToGlobal(lens_center);
 
          lens_mask = cv::Mat::zeros(roi_image.size(), CV_8UC1);
-         cv::circle(lens_mask, lens_center, static_cast<int>(lens_radius), cv::Scalar(255), -1);
+         cv::circle(lens_mask, lens_center, static_cast<int>(lens_radius*0.98), cv::Scalar(255), -1);
 
       }
       catch (const cv::Exception& e) {
@@ -665,6 +668,8 @@ public:
    }
 
    void analyze(EvaluationMetric metric = EvaluationMetric::COMBINED_SCORE) {
+
+      current_metric = metric;  // Salva la metrica per uso successivo
       try {
          std::cout << "=== ANALISI LENTE BI-MIRROR (Versione Parallela con OpenMP) ===" << std::endl;
 
@@ -788,7 +793,7 @@ public:
             static_cast<int>(p2_global.x * scale_factor),
             static_cast<int>(p2_global.y * scale_factor)
          );
-         cv::line(display_for_drawing, p1_banda, p2_banda, cv::Scalar(255, 0, 0), 2);
+//         cv::line(display_for_drawing, p1_banda, p2_banda, cv::Scalar(255, 0, 0), 2);
 
          // Linea di distanza minima - in verde
          cv::Point2f closest_global = roiToGlobal(band_analysis.closest_point);
@@ -997,8 +1002,10 @@ public:
       }
    }
 
+   // Versione modificata di analyzeBandPosition che usa la stessa metrica
    BandLineResult analyzeBandPosition() {
-      std::cout << "\nAnalisi posizione banda chiara centrata..." << std::endl;
+      std::cout << "\nAnalisi posizione banda chiara usando metrica: "
+         << getMetricName(current_metric) << std::endl;
 
       // Usa l'angolo ottimale già trovato
       auto [sin_val, cos_val] = trig_lut.getSinCos(optimal_angle);
@@ -1009,69 +1016,106 @@ public:
       cv::warpAffine(roi_image, rotated, rotation_matrix, roi_image.size());
       cv::warpAffine(lens_mask, rotated_mask, rotation_matrix, lens_mask.size());
 
-      // Dopo la rotazione ottimale, la banda chiara è orizzontale
-      // Riutilizziamo la stessa logica di analyzeRotationProfile per trovare la posizione esatta
+      // Riutilizza la stessa logica di analyzeRotationProfile
+      IntegralResult band_result = analyzeRotationProfile(optimal_angle);
 
-      int start_y = std::max(0, static_cast<int>(lens_center.y - lens_radius));
-      int end_y = std::min(rotated.rows, static_cast<int>(lens_center.y + lens_radius));
-      int num_rows = end_y - start_y;
+      // Determina la posizione della banda basandosi sulla metrica selezionata
+      double band_y_position;
+      int band_center_idx;
 
-      std::vector<double> row_profile(num_rows);
-      std::vector<int> positions(num_rows);
+      switch (current_metric) {
+      case EvaluationMetric::INTEGRAL_VALUE:
+      case EvaluationMetric::COMBINED_SCORE:
+         // Usa il centro della striscia chiara identificata dall'integrale
+         if (band_result.bright_stripe_start == -1 || band_result.bright_stripe_end == -1) {
+            throw std::runtime_error("Impossibile determinare i limiti della striscia chiara");
+         }
+         band_center_idx = (band_result.bright_stripe_start + band_result.bright_stripe_end) / 2;
+         band_y_position = band_result.positions[band_center_idx];
+         break;
 
-      // Calcola il profilo per righe (integrale lungo X per ogni Y)
-      for (int idx = 0; idx < num_rows; idx++) {
-         int y = start_y + idx;
-         double row_sum = 0;
-         int pixel_count = 0;
+      case EvaluationMetric::INTEGRAL_AMPLITUDE:
+         // Per l'ampiezza, trova la striscia più ampia
+      {
+         // Identifica tutte le strisce continue sopra la media
+         double min_val = *std::min_element(band_result.profile.begin(), band_result.profile.end());
+         double max_val = *std::max_element(band_result.profile.begin(), band_result.profile.end());
 
-         for (int x = 0; x < rotated.cols; x++) {
-            if (rotated_mask.at<uchar>(y, x) > 0) {
-               row_sum += rotated.at<uchar>(y, x);
-               pixel_count++;
+         if (max_val == min_val) {
+            throw std::runtime_error("Profilo uniforme, impossibile identificare la banda");
+         }
+
+         std::vector<double> normalized(band_result.profile.size());
+         for (size_t i = 0; i < band_result.profile.size(); i++) {
+            normalized[i] = (band_result.profile[i] - min_val) / (max_val - min_val);
+         }
+
+         double mean_norm = std::accumulate(normalized.begin(), normalized.end(), 0.0) / normalized.size();
+
+         // Trova tutte le regioni continue sopra la media
+         std::vector<std::pair<int, int>> regions;
+         bool in_region = false;
+         int start = 0;
+
+         for (int i = 0; i < normalized.size(); i++) {
+            if (normalized[i] > mean_norm && !in_region) {
+               start = i;
+               in_region = true;
+            }
+            else if (normalized[i] <= mean_norm && in_region) {
+               regions.push_back({ start, i - 1 });
+               in_region = false;
+            }
+         }
+         if (in_region) {
+            regions.push_back({ start, static_cast<int>(normalized.size()) - 1 });
+         }
+
+         // Trova la regione più ampia
+         int max_width = 0;
+         int best_start = 0, best_end = 0;
+         for (const auto& region : regions) {
+            int width = region.second - region.first + 1;
+            if (width > max_width) {
+               max_width = width;
+               best_start = region.first;
+               best_end = region.second;
             }
          }
 
-         if (pixel_count > 0) {
-            row_profile[idx] = row_sum / pixel_count;
-            positions[idx] = y;
-         }
-         else {
-            row_profile[idx] = 0;
-            positions[idx] = y;
-         }
+         band_center_idx = (best_start + best_end) / 2;
+         band_y_position = band_result.positions[band_center_idx];
+      }
+      break;
+
+      case EvaluationMetric::MAX_INTEGRAL:
+         // Trova il punto di massima intensità
+      {
+         auto max_it = std::max_element(band_result.profile.begin(), band_result.profile.end());
+         band_center_idx = static_cast<int>(std::distance(band_result.profile.begin(), max_it));
+         band_y_position = band_result.positions[band_center_idx];
+      }
+      break;
       }
 
-      // Trova il massimo nel profilo
-      int max_idx = -1;
-      double max_value = 0;
-
-      for (int i = 0; i < num_rows; i++) {
-         if (row_profile[i] > max_value) {
-            max_value = row_profile[i];
-            max_idx = i;
-         }
-      }
-
-      if (max_idx == -1) {
-         throw std::runtime_error("Impossibile trovare la banda chiara");
-      }
-
-      // Affina la posizione usando una media pesata intorno al picco
+      // Affina la posizione usando una media pesata intorno al punto identificato
       double weighted_sum = 0;
       double weight_total = 0;
-      int window = 10; // finestra di ricerca intorno al picco
+      int window = 10; // finestra di ricerca intorno al punto centrale
 
-      int start_window = std::max(0, max_idx - window);
-      int end_window = std::min(num_rows, max_idx + window + 1);
+      int start_window = std::max(0, band_center_idx - window);
+      int end_window = std::min(static_cast<int>(band_result.profile.size()),
+         band_center_idx + window + 1);
 
       for (int i = start_window; i < end_window; i++) {
-         double weight = row_profile[i];
-         weighted_sum += positions[i] * weight;
+         double weight = band_result.profile[i];
+         weighted_sum += band_result.positions[i] * weight;
          weight_total += weight;
       }
 
-      double band_y_position = weighted_sum / weight_total;
+      if (weight_total > 0) {
+         band_y_position = weighted_sum / weight_total;
+      }
 
       // Crea il risultato
       BandLineResult result;
@@ -1109,12 +1153,29 @@ public:
       double offset_from_center = band_y_position - theoretical_center_y;
 
       // Output dei risultati
+      std::cout << "   Metrica utilizzata: " << getMetricName(current_metric) << std::endl;
+      std::cout << "   Valore della metrica: " << getMetricValue(band_result, current_metric) << std::endl;
       std::cout << "   Posizione Y della banda (coordinate ruotate): " << band_y_position << std::endl;
       std::cout << "   Centro teorico Y: " << theoretical_center_y << std::endl;
       std::cout << "   Offset dal centro: " << offset_from_center << " pixel" << std::endl;
       std::cout << "   Distanza assoluta dal centro: " << result.distance << " pixel" << std::endl;
       std::cout << "   Posizione banda: " << (offset_from_center < 0 ? "sopra" : "sotto") << " il centro" << std::endl;
-      std::cout << "   Intensità massima trovata: " << max_value << std::endl;
+
+      // Informazioni aggiuntive basate sulla metrica
+      switch (current_metric) {
+      case EvaluationMetric::INTEGRAL_VALUE:
+         std::cout << "   Valore integrale: " << band_result.integral_value << std::endl;
+         break;
+      case EvaluationMetric::INTEGRAL_AMPLITUDE:
+         std::cout << "   Ampiezza banda: " << band_result.integral_amplitude << " pixel" << std::endl;
+         break;
+      case EvaluationMetric::COMBINED_SCORE:
+         std::cout << "   Score combinato: " << band_result.combined_score << std::endl;
+         break;
+      case EvaluationMetric::MAX_INTEGRAL:
+         std::cout << "   Intensità massima: " << band_result.max_integral << std::endl;
+         break;
+      }
 
       return result;
    }
@@ -1124,11 +1185,11 @@ int main(int argc, char** argv) {
    try {
 #ifdef _OPENMP
       // Configura il numero di thread OpenMP (opzionale)
-      // omp_set_num_threads(4); // Forza 4 thread se necessario
+       omp_set_num_threads(6); // Forza 4 thread se necessario
 #endif
 
-      std::string nomeFileImg = "imgBiDeg.png";
-      //std::string nomeFileImg = "Bi_IRconFiltro.png";
+      //std::string nomeFileImg = "imgBiDeg.png";
+      std::string nomeFileImg = "Bi_IRconFiltro.png";
       BiMirrorLensAnalyzer::EvaluationMetric metrica = BiMirrorLensAnalyzer::EvaluationMetric::INTEGRAL_VALUE;
 
       // Parsing argomenti
