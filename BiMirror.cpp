@@ -206,12 +206,14 @@ private:
    cv::Vec4f axis_line_global;
    TrigonometricLUT trig_lut;
    EvaluationMetric current_metric;  // Memorizza la metrica corrente
+   IntegralResult optimal_result;
+   bool has_optimal_result;
 
 public:
   
 
 
-   BiMirrorLensAnalyzer() : lens_radius(0), optimal_angle(0), trig_lut(0.5) {
+   BiMirrorLensAnalyzer() : lens_radius(0), optimal_angle(0), trig_lut(0.5), has_optimal_result(false) {
 #ifdef _OPENMP
       std::cout << "OpenMP disponibile - Thread disponibili: " << omp_get_max_threads() << std::endl;
 #else
@@ -269,12 +271,13 @@ public:
    void detectLens() {
       try {
          cv::Mat blurred;
-         cv::GaussianBlur(roi_image, blurred, cv::Size(9, 9), 2);
+         //cv::GaussianBlur(roi_image, blurred, cv::Size(9, 9), 2);
 
          std::vector<cv::Vec3f> circles;
-         cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1,
+         //cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1,
+         cv::HoughCircles(roi_image, circles, cv::HOUGH_GRADIENT, 1,
             roi_image.rows / 4,
-            50, 12,     // 50, 5 era prima         50,11
+				60, 30,     // 50, 5 era prima         50,11       50,12    primo par e' la soglia superiore di Canny, secondo par la sensibilita' per i contorni ... piu' basso maggior sensibilita'
             roi_image.rows / 4,
             roi_image.rows / 2);
 
@@ -294,7 +297,7 @@ public:
          lens_center_global = roiToGlobal(lens_center);
 
          lens_mask = cv::Mat::zeros(roi_image.size(), CV_8UC1);
-         cv::circle(lens_mask, lens_center, static_cast<int>(lens_radius*0.98), cv::Scalar(255), -1);
+         cv::circle(lens_mask, lens_center, static_cast<int>(lens_radius), cv::Scalar(255), -1);
 
       }
       catch (const cv::Exception& e) {
@@ -323,7 +326,7 @@ public:
             result.integral_value = 0;
             result.integral_amplitude = 0;
             result.combined_score = 0;
-            result.max_integral = 0;  // NUOVO
+            result.max_integral = 0;
             return result;
          }
 
@@ -568,7 +571,7 @@ public:
    }
 
    // LOOP PRINCIPALE PARALLELIZZATO CON SCELTA METRICA
-   std::vector<IntegralResult> findOptimalOrientation(EvaluationMetric metric = EvaluationMetric::COMBINED_SCORE) {
+   std::vector<IntegralResult> findOptimalOrientation(EvaluationMetric metric = EvaluationMetric::INTEGRAL_VALUE) {
       try {
          std::cout << "Inizio analisi sistematica rotazioni (versione parallela)..." << std::endl;
          std::cout << "Metrica di valutazione: " << getMetricName(metric) << std::endl;
@@ -612,7 +615,10 @@ public:
             throw std::runtime_error("Impossibile trovare orientamento ottimale con la metrica: " + getMetricName(metric));
          }
 
+         // NUOVO: Salva il risultato completo, non solo l'angolo
+         optimal_result = *best_result;
          optimal_angle = best_result->angle;
+         has_optimal_result = true;
 
          std::cout << "\n=== RISULTATO OTTIMALE ===" << std::endl;
          std::cout << "Metrica utilizzata: " << getMetricName(metric) << std::endl;
@@ -634,8 +640,12 @@ public:
 
    void calculateOptimalCentralAxis() {
       try {
-         IntegralResult optimal_result = analyzeRotationProfile(optimal_angle);
+         // Verifica che abbiamo un risultato ottimale salvato
+         if (!has_optimal_result) {
+            throw std::runtime_error("Nessun risultato ottimale disponibile. Eseguire prima findOptimalOrientation()");
+         }
 
+         // Usa direttamente i dati salvati invece di ricalcolare
          if (optimal_result.bright_stripe_start == -1 || optimal_result.bright_stripe_end == -1) {
             throw std::runtime_error("Impossibile determinare i limiti della striscia chiara");
          }
@@ -667,7 +677,7 @@ public:
       }
    }
 
-   void analyze(EvaluationMetric metric = EvaluationMetric::COMBINED_SCORE) {
+   void analyze(EvaluationMetric metric = EvaluationMetric::INTEGRAL_VALUE) {
 
       current_metric = metric;  // Salva la metrica per uso successivo
       try {
@@ -713,7 +723,7 @@ public:
          original_image.copyTo(display);
 
          // Calcola il fattore di scala ottimale per la visualizzazione
-         double scale_factor = 0.5;
+         double scale_factor = 1.;
          const int max_display_width = 1200;   // Larghezza massima desiderata
          const int max_display_height = 800;   // Altezza massima desiderata
 
@@ -836,7 +846,8 @@ public:
 
          // Grafica per analyzeBandPosition
          // Cerchietto sul punto più vicino per evidenziarlo
-         cv::circle(display_for_drawing, closest_scaled, 5, cv::Scalar(0, 255, 0), -1);
+//         cv::circle(display_for_drawing, closest_scaled, 5, cv::Scalar(0, 255, 0), -1);
+         cv::circle(display_for_drawing, lens_center_global_scaled, 5, cv::Scalar(0, 255, 0), -1);
 
          // Aggiungi testo per indicare la posizione della banda
          std::string position_text = "Banda: " +
@@ -1007,17 +1018,13 @@ public:
       std::cout << "\nAnalisi posizione banda chiara usando metrica: "
          << getMetricName(current_metric) << std::endl;
 
-      // Usa l'angolo ottimale già trovato
-      auto [sin_val, cos_val] = trig_lut.getSinCos(optimal_angle);
+      // Verifica che abbiamo un risultato ottimale salvato
+      if (!has_optimal_result) {
+         throw std::runtime_error("Nessun risultato ottimale disponibile. Eseguire prima findOptimalOrientation()");
+      }
 
-      // Ruota l'immagine all'angolo ottimale
-      cv::Mat rotation_matrix = cv::getRotationMatrix2D(lens_center, optimal_angle, 1.0);
-      cv::Mat rotated, rotated_mask;
-      cv::warpAffine(roi_image, rotated, rotation_matrix, roi_image.size());
-      cv::warpAffine(lens_mask, rotated_mask, rotation_matrix, lens_mask.size());
-
-      // Riutilizza la stessa logica di analyzeRotationProfile
-      IntegralResult band_result = analyzeRotationProfile(optimal_angle);
+      // USA DIRETTAMENTE I DATI GIÀ CALCOLATI invece di ricalcolare tutto
+      const IntegralResult& band_result = optimal_result;
 
       // Determina la posizione della banda basandosi sulla metrica selezionata
       double band_y_position;
@@ -1037,53 +1044,8 @@ public:
       case EvaluationMetric::INTEGRAL_AMPLITUDE:
          // Per l'ampiezza, trova la striscia più ampia
       {
-         // Identifica tutte le strisce continue sopra la media
-         double min_val = *std::min_element(band_result.profile.begin(), band_result.profile.end());
-         double max_val = *std::max_element(band_result.profile.begin(), band_result.profile.end());
-
-         if (max_val == min_val) {
-            throw std::runtime_error("Profilo uniforme, impossibile identificare la banda");
-         }
-
-         std::vector<double> normalized(band_result.profile.size());
-         for (size_t i = 0; i < band_result.profile.size(); i++) {
-            normalized[i] = (band_result.profile[i] - min_val) / (max_val - min_val);
-         }
-
-         double mean_norm = std::accumulate(normalized.begin(), normalized.end(), 0.0) / normalized.size();
-
-         // Trova tutte le regioni continue sopra la media
-         std::vector<std::pair<int, int>> regions;
-         bool in_region = false;
-         int start = 0;
-
-         for (int i = 0; i < normalized.size(); i++) {
-            if (normalized[i] > mean_norm && !in_region) {
-               start = i;
-               in_region = true;
-            }
-            else if (normalized[i] <= mean_norm && in_region) {
-               regions.push_back({ start, i - 1 });
-               in_region = false;
-            }
-         }
-         if (in_region) {
-            regions.push_back({ start, static_cast<int>(normalized.size()) - 1 });
-         }
-
-         // Trova la regione più ampia
-         int max_width = 0;
-         int best_start = 0, best_end = 0;
-         for (const auto& region : regions) {
-            int width = region.second - region.first + 1;
-            if (width > max_width) {
-               max_width = width;
-               best_start = region.first;
-               best_end = region.second;
-            }
-         }
-
-         band_center_idx = (best_start + best_end) / 2;
+         // Usa direttamente i dati già calcolati in optimal_result
+         band_center_idx = (band_result.bright_stripe_start + band_result.bright_stripe_end) / 2;
          band_y_position = band_result.positions[band_center_idx];
       }
       break;
@@ -1162,20 +1124,7 @@ public:
       std::cout << "   Posizione banda: " << (offset_from_center < 0 ? "sopra" : "sotto") << " il centro" << std::endl;
 
       // Informazioni aggiuntive basate sulla metrica
-      switch (current_metric) {
-      case EvaluationMetric::INTEGRAL_VALUE:
-         std::cout << "   Valore integrale: " << band_result.integral_value << std::endl;
-         break;
-      case EvaluationMetric::INTEGRAL_AMPLITUDE:
-         std::cout << "   Ampiezza banda: " << band_result.integral_amplitude << " pixel" << std::endl;
-         break;
-      case EvaluationMetric::COMBINED_SCORE:
-         std::cout << "   Score combinato: " << band_result.combined_score << std::endl;
-         break;
-      case EvaluationMetric::MAX_INTEGRAL:
-         std::cout << "   Intensità massima: " << band_result.max_integral << std::endl;
-         break;
-      }
+      std::cout << "   (Dati riutilizzati dal calcolo dell'orientamento ottimale)" << std::endl;
 
       return result;
    }
