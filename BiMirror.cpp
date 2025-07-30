@@ -12,6 +12,10 @@
 #include <algorithm>
 #include <chrono>
 #include <numeric>
+#include <immintrin.h>  // Per AVX/SSE
+#include <future>
+#include <opencv2/core/ocl.hpp>
+
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -159,6 +163,35 @@ double normalizzaAngolo(double angolo) {
    return angolo;
 }
 
+// questa classe per il caching delle rotazioni
+class RotationCache {
+private:
+   struct CacheEntry {
+      cv::Mat rotated_image;
+      cv::Mat rotated_mask;
+   };
+   std::unordered_map<int, CacheEntry> cache;
+
+public:
+   bool getRotation(double angle, cv::Mat& rotated, cv::Mat& mask) {
+      int angle_key = static_cast<int>(angle * 2); // Per step di 0.5
+      auto it = cache.find(angle_key);
+      if (it != cache.end()) {
+         rotated = it->second.rotated_image;
+         mask = it->second.rotated_mask;
+         return true;
+      }
+      return false;
+   }
+
+   void storeRotation(double angle, const cv::Mat& rotated, const cv::Mat& mask) {
+      int angle_key = static_cast<int>(angle * 2);
+      cache[angle_key] = { rotated.clone(), mask.clone() };
+   }
+};
+
+
+
 class BiMirrorLensAnalyzer {
 public:
    // Enum per le metriche di valutazione
@@ -208,19 +241,131 @@ private:
    EvaluationMetric current_metric;  // Memorizza la metrica corrente
    IntegralResult optimal_result;
    bool has_optimal_result;
+   cv::Mat temp_rotated;
+   cv::Mat temp_rotated_mask;
+   std::vector<double> temp_profile;
+   std::vector<int> temp_positions;
 
+   // Pool di thread per operazioni asincrone
+   std::vector<std::future<IntegralResult>> futures;
+   std::vector<IntegralResult> processAngleBatchGPU(const std::vector<double>& angles, cv::UMat& gpu_roi, cv::UMat& gpu_mask)
+   {
+      std::vector<IntegralResult> results(angles.size());
+      std::vector<std::future<IntegralResult>> futures;
+
+      //// Step 1: Esegui tutte le rotazioni del batch
+      //std::vector<cv::UMat> rotated_images(angles.size());
+      //std::vector<cv::UMat> rotated_masks(angles.size());
+
+      //// Rotazioni in parallelo su GPU
+      //for (size_t i = 0; i < angles.size(); i++) {
+      //   cv::Mat rotation_matrix = cv::getRotationMatrix2D(lens_center, angles[i], 1.0);
+      //   cv::warpAffine(gpu_roi, rotated_images[i], rotation_matrix, roi_image.size());
+      //   cv::warpAffine(gpu_mask, rotated_masks[i], rotation_matrix, lens_mask.size());
+      //}
+
+      //// Step 2: Analizza ogni immagine ruotata con reduce
+      //for (size_t i = 0; i < angles.size(); i++) {
+      //   results[i] = analyzeRotatedImageGPU(rotated_images[i], rotated_masks[i], angles[i]);
+      //}
+
+      // Lancia le rotazioni in modo asincrono
+      for (size_t i = 0; i < angles.size(); i++) {
+         futures.push_back(
+            std::async(std::launch::async, [this, &gpu_roi, &gpu_mask, angles, i]() {
+               cv::UMat rotated, mask;
+               cv::Mat M = cv::getRotationMatrix2D(lens_center, angles[i], 1.0);
+               cv::warpAffine(gpu_roi, rotated, M, roi_image.size());
+               cv::warpAffine(gpu_mask, mask, M, lens_mask.size());
+               return analyzeRotatedImageGPU(rotated, mask, angles[i]);
+               })
+         );
+      }
+
+      // Raccogli i risultati
+      for (size_t i = 0; i < futures.size(); i++) {
+         results[i] = futures[i].get();
+      }
+
+      return results;
+   }
+
+   // Analisi ottimizzata con reduce operations
+   IntegralResult analyzeRotatedImageGPU(
+      cv::UMat& rotated,
+      cv::UMat& mask,
+      double angle)
+   {
+      IntegralResult result;
+      result.angle = angle;
+
+      int start_y = std::max(0, static_cast<int>(lens_center.y - lens_radius));
+      int end_y = std::min(rotated.rows, static_cast<int>(lens_center.y + lens_radius));
+      int num_rows = end_y - start_y;
+
+      if (num_rows < 10) {
+         result.integral_value = 0;
+         result.integral_amplitude = 0;
+         result.combined_score = 0;
+         result.max_integral = 0;
+         return result;
+      }
+
+      // Estrai la striscia
+      cv::UMat strip = rotated(cv::Range(start_y, end_y), cv::Range::all());
+      cv::UMat mask_strip = mask(cv::Range(start_y, end_y), cv::Range::all());
+
+      // IMPORTANTE: Usa CV_64F per mantenere la precisione double!
+      cv::UMat strip_double, mask_double;
+      strip.convertTo(strip_double, CV_64F);
+
+      // Crea una maschera binaria (0 o 1) invece di 0-255
+      cv::UMat mask_binary;
+      cv::threshold(mask_strip, mask_binary, 0, 1.0, cv::THRESH_BINARY);
+      mask_binary.convertTo(mask_double, CV_64F);
+
+      // Applica la maschera
+      cv::UMat masked;
+      cv::multiply(strip_double, mask_double, masked);
+
+      // Somma i valori e conta i pixel validi
+      cv::UMat row_sums, pixel_counts;
+      cv::reduce(masked, row_sums, 1, cv::REDUCE_SUM, CV_64F);
+      cv::reduce(mask_double, pixel_counts, 1, cv::REDUCE_SUM, CV_64F);
+
+      // Scarica dalla GPU
+      cv::Mat sums_cpu, counts_cpu;
+      row_sums.copyTo(sums_cpu);
+      pixel_counts.copyTo(counts_cpu);
+
+      // Calcola il profilo
+      result.profile.resize(num_rows);
+      result.positions.resize(num_rows);
+
+      for (int i = 0; i < num_rows; i++) {
+         double pixel_count = counts_cpu.at<double>(i);
+         if (pixel_count > 0) {
+            result.profile[i] = sums_cpu.at<double>(i) / pixel_count;
+         }
+         else {
+            result.profile[i] = 0;
+         }
+         result.positions[i] = start_y + i;
+      }
+
+      calculateIntegralMetrics(result);
+      return result;
+   }
 public:
-  
-
-
    BiMirrorLensAnalyzer() : lens_radius(0), optimal_angle(0), trig_lut(0.5), has_optimal_result(false) {
 #ifdef _OPENMP
       std::cout << "OpenMP disponibile - Thread disponibili: " << omp_get_max_threads() << std::endl;
 #else
       std::cout << "OpenMP non disponibile - Esecuzione sequenziale" << std::endl;
 #endif
+      temp_profile.reserve(1000);
+      temp_positions.reserve(1000);
    }
-
    void initializeTrigonometry() {
       trig_lut.initialize();
    }
@@ -364,6 +509,199 @@ public:
       catch (const std::exception& e) {
          throw std::runtime_error("Errore durante l'analisi rotazione: " + std::string(e.what()));
       }
+   }
+
+   IntegralResult analyzeRotationProfileGPU(double rotation_angle) {
+      try {
+         IntegralResult result;
+         result.angle = rotation_angle;
+
+         auto [sin_val, cos_val] = trig_lut.getSinCos(rotation_angle);
+
+         // Usa UMat per operazioni GPU
+         cv::UMat roi_umat, mask_umat;
+         roi_image.copyTo(roi_umat);
+         lens_mask.copyTo(mask_umat);
+
+         cv::UMat rotated_umat, rotated_mask_umat;
+         cv::Mat rotation_matrix = cv::getRotationMatrix2D(lens_center, rotation_angle, 1.0);
+
+         // Queste operazioni sono accelerate via OpenCL
+         cv::warpAffine(roi_umat, rotated_umat, rotation_matrix, roi_image.size(), cv::INTER_LINEAR);
+         cv::warpAffine(mask_umat, rotated_mask_umat, rotation_matrix, lens_mask.size(), cv::INTER_LINEAR);
+
+         // Converti back a Mat per l'analisi del profilo
+         cv::Mat rotated, rotated_mask;
+         rotated_umat.copyTo(rotated);
+         rotated_mask_umat.copyTo(rotated_mask);
+
+         int start_y = std::max(0, static_cast<int>(lens_center.y - lens_radius));
+         int end_y = std::min(rotated.rows, static_cast<int>(lens_center.y + lens_radius));
+         int num_rows = end_y - start_y;
+
+         if (num_rows < 10) {
+            result.integral_value = 0;
+            result.integral_amplitude = 0;
+            result.combined_score = 0;
+            result.max_integral = 0;
+            return result;
+         }
+
+         result.profile.resize(num_rows);
+         result.positions.resize(num_rows);
+
+         // Il calcolo del profilo resta su CPU (difficile da parallelizzare su GPU per questa operazione)
+#pragma omp parallel for
+         for (int idx = 0; idx < num_rows; idx++) {
+            int y = start_y + idx;
+            double row_sum = 0;
+            int pixel_count = 0;
+
+            const uchar* mask_row = rotated_mask.ptr<uchar>(y);
+            const uchar* img_row = rotated.ptr<uchar>(y);
+
+            for (int x = 0; x < rotated.cols; x++) {
+               if (mask_row[x] > 0) {
+                  row_sum += img_row[x];
+                  pixel_count++;
+               }
+            }
+
+            if (pixel_count > 0) {
+               result.profile[idx] = row_sum / pixel_count;
+               result.positions[idx] = y;
+            }
+            else {
+               result.profile[idx] = 0;
+               result.positions[idx] = y;
+            }
+         }
+
+         calculateIntegralMetrics(result);
+         return result;
+
+      }
+      catch (const std::exception& e) {
+         // Fallback su versione CPU in caso di errore
+         std::cerr << "Errore GPU, fallback su CPU: " << e.what() << std::endl;
+         return analyzeRotationProfile(rotation_angle);
+      }
+   }
+
+   std::vector<IntegralResult> analyzeRotationBatchGPU(const std::vector<double>& angles) {
+      std::vector<IntegralResult> results(angles.size());
+
+      // Pre-carica una sola volta
+      cv::UMat roi_umat, mask_umat;
+      roi_image.copyTo(roi_umat);
+      lens_mask.copyTo(mask_umat);
+
+      // Buffer per il batch
+      std::vector<cv::UMat> rotated_batch(angles.size());
+      std::vector<cv::UMat> mask_batch(angles.size());
+
+      // FASE 1: Tutte le rotazioni su GPU in parallelo
+      for (size_t i = 0; i < angles.size(); i++) {
+         cv::Mat M = cv::getRotationMatrix2D(lens_center, angles[i], 1.0);
+         cv::warpAffine(roi_umat, rotated_batch[i], M, roi_image.size());
+         cv::warpAffine(mask_umat, mask_batch[i], M, lens_mask.size());
+      }
+
+      // FASE 2: Analisi con reduce (opzione 3) per ogni immagine ruotata
+      for (size_t i = 0; i < angles.size(); i++) {
+         // Calcola profilo con reduce operations GPU-ottimizzate
+         results[i] = calculateProfileWithReduce(rotated_batch[i], mask_batch[i], angles[i]);
+      }
+
+      return results;
+   }
+
+   IntegralResult calculateProfileWithReduce(cv::UMat& rotated, cv::UMat& mask, double angle) {
+      IntegralResult result;
+      result.angle = angle;
+
+      // Estrai la striscia
+      int start_y = std::max(0, static_cast<int>(lens_center.y - lens_radius));
+      int end_y = std::min(rotated.rows, static_cast<int>(lens_center.y + lens_radius));
+
+      cv::UMat strip = rotated(cv::Range(start_y, end_y), cv::Range::all());
+      cv::UMat mask_strip = mask(cv::Range(start_y, end_y), cv::Range::all());
+
+      // Converti a float
+      cv::UMat strip_float, mask_float;
+      strip.convertTo(strip_float, CV_32F);
+      mask_strip.convertTo(mask_float, CV_32F, 1.0 / 255.0);
+
+      // Moltiplica per la maschera
+      cv::UMat masked;
+      cv::multiply(strip_float, mask_float, masked);
+
+      // Reduce per sommare lungo le righe (MOLTO veloce su GPU)
+      cv::UMat row_sums, row_counts;
+      cv::reduce(masked, row_sums, 1, cv::REDUCE_SUM);
+      cv::reduce(mask_float, row_counts, 1, cv::REDUCE_SUM);
+
+      // Una sola copia GPU->CPU per batch
+      cv::Mat sums, counts;
+      row_sums.copyTo(sums);
+      row_counts.copyTo(counts);
+
+      // Calcolo veloce delle medie
+      result.profile.resize(sums.rows);
+      result.positions.resize(sums.rows);
+
+      for (int i = 0; i < sums.rows; i++) {
+         float count = counts.at<float>(i);
+         result.profile[i] = (count > 0) ? sums.at<float>(i) / count : 0;
+         result.positions[i] = start_y + i;
+      }
+
+      calculateIntegralMetrics(result);
+      return result;
+   }
+
+   void enableOpenCVOptimizations() {
+      // Abilita OpenCL se disponibile
+      cv::ocl::setUseOpenCL(true);
+
+      // Verifica se è attivo
+      if (cv::ocl::useOpenCL()) {
+         std::cout << "OpenCL abilitato per accelerazione GPU" << std::endl;
+
+         // Mostra info sul dispositivo
+         std::vector<cv::ocl::PlatformInfo> platforms;
+         cv::ocl::getPlatfomsInfo(platforms);
+
+         for (size_t i = 0; i < platforms.size(); i++) {
+            const cv::ocl::PlatformInfo& platform = platforms[i];
+            std::cout << "  Piattaforma " << i << ": " << platform.name() << std::endl;
+
+            for (int j = 0; j < platform.deviceNumber(); j++) {
+               cv::ocl::Device device;
+               platform.getDevice(device, j);
+               std::cout << "    Device: " << device.name() << std::endl;
+               std::cout << "    Tipo: " << (device.type() == cv::ocl::Device::TYPE_GPU ? "GPU" : "CPU") << std::endl;
+            }
+         }
+
+         // Pre-carica i kernel OpenCL con operazione dummy
+         cv::UMat temp;
+         roi_image.copyTo(temp);
+         cv::UMat rotated;
+         cv::Mat M = cv::getRotationMatrix2D(cv::Point2f(static_cast<float>(temp.cols) / 2.f, static_cast<float>(temp.rows) / 2.f), 45, 1.0);
+         cv::warpAffine(temp, rotated, M, temp.size());
+         std::cout << "  Kernel OpenCL pre-caricati" << std::endl;
+      }
+      else {
+         std::cout << "OpenCL non disponibile - uso ottimizzazioni CPU" << std::endl;
+      }
+
+      // Abilita anche ottimizzazioni CPU
+      cv::setNumThreads(cv::getNumberOfCPUs());
+      cv::setUseOptimized(true);
+
+      std::cout << "Ottimizzazioni CPU: " << cv::getNumberOfCPUs() << " thread" << std::endl;
+      std::cout << "SIMD: " << (cv::useOptimized() ? "Abilitato" : "Disabilitato") << std::endl;
    }
 
    void calculateIntegralMetrics(IntegralResult& result) {
@@ -576,6 +914,14 @@ public:
          std::cout << "Inizio analisi sistematica rotazioni (versione parallela)..." << std::endl;
          std::cout << "Metrica di valutazione: " << getMetricName(metric) << std::endl;
 
+         bool use_gpu = cv::ocl::useOpenCL();
+         if (use_gpu) {
+            std::cout << "Uso accelerazione GPU OpenCL per le rotazioni" << std::endl;
+         }
+         else {
+            std::cout << "OpenCL non disponibile, uso CPU" << std::endl;
+         }
+
          auto start_time = std::chrono::high_resolution_clock::now();
 
          double angle_step = 0.5;
@@ -588,10 +934,16 @@ public:
 #pragma omp parallel for schedule(dynamic, 4)
          for (int i = 0; i < num_angles; i++) {
             double angle = i * angle_step;
-            results[i] = analyzeRotationProfile(angle);
+
+            if (use_gpu) {
+               results[i] = analyzeRotationProfileGPU(angle);
+            }
+            else {
+               results[i] = analyzeRotationProfile(angle);
+            }
 
             // Progress report thread-safe
-            if (i % 20 == 0) {
+            if (i % 40 == 0) {
 #pragma omp critical
                {
                   std::cout << "   Processato angolo: " << angle << "° (thread: "
@@ -635,6 +987,98 @@ public:
       }
       catch (const std::exception& e) {
          throw std::runtime_error("Errore durante la ricerca dell'orientamento: " + std::string(e.what()));
+      }
+   }
+
+   std::vector<IntegralResult> findOptimalOrientationBatchGPU(EvaluationMetric metric = EvaluationMetric::INTEGRAL_VALUE)
+   {
+      try {
+         std::cout << "Inizio analisi con Batch GPU Processing + Reduce Operations..." << std::endl;
+         std::cout << "Metrica di valutazione: " << getMetricName(metric) << std::endl;
+
+         // Verifica disponibilità GPU
+         if (!cv::ocl::useOpenCL()) {
+            std::cout << "GPU non disponibile, uso metodo CPU standard" << std::endl;
+            return findOptimalOrientation(metric);
+         }
+
+         auto start_time = std::chrono::high_resolution_clock::now();
+
+         const double angle_step = 0.5;
+         const double max_angle = 180.0;
+         const int num_angles = static_cast<int>(max_angle / angle_step);
+         const int BATCH_SIZE = 32; // Dimensione ottimale del batch
+
+         // Pre-carica i dati sulla GPU UNA SOLA VOLTA
+         cv::UMat gpu_roi, gpu_mask;
+         roi_image.copyTo(gpu_roi);
+         lens_mask.copyTo(gpu_mask);
+         std::cout << "Dati caricati su GPU" << std::endl;
+
+         std::vector<IntegralResult> all_results;
+         all_results.reserve(num_angles);
+
+         // Processa in batch
+         for (int batch_start = 0; batch_start < num_angles; batch_start += BATCH_SIZE) {
+            int batch_end = std::min(batch_start + BATCH_SIZE, num_angles);
+            int current_batch_size = batch_end - batch_start;
+
+            // Prepara gli angoli per questo batch
+            std::vector<double> batch_angles;
+            batch_angles.reserve(current_batch_size);
+            for (int i = batch_start; i < batch_end; i++) {
+               batch_angles.push_back(i * angle_step);
+            }
+
+            // Processa il batch
+            auto batch_results = processAngleBatchGPU(batch_angles, gpu_roi, gpu_mask);
+
+            // Aggiungi i risultati
+            all_results.insert(all_results.end(),
+               batch_results.begin(),
+               batch_results.end());
+
+            // Progress report
+            int progress = (batch_end * 100) / num_angles;
+            std::cout << "\rProgresso GPU Batch: " << progress << "% "
+               << "(Batch " << (batch_start / BATCH_SIZE + 1)
+               << "/" << ((num_angles + BATCH_SIZE - 1) / BATCH_SIZE) << ")"
+               << std::flush;
+         }
+         std::cout << std::endl;
+
+         auto end_time = std::chrono::high_resolution_clock::now();
+         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+         std::cout << "Tempo totale elaborazione GPU: " << duration.count() << " ms" << std::endl;
+         std::cout << "Tempo medio per angolo: "
+            << (duration.count() / static_cast<double>(num_angles)) << " ms" << std::endl;
+
+         // Trova il risultato ottimale
+         auto best_result = std::max_element(all_results.begin(), all_results.end(),
+            [this, metric](const IntegralResult& a, const IntegralResult& b) {
+               return getMetricValue(a, metric) < getMetricValue(b, metric);
+            });
+
+         if (best_result == all_results.end() || getMetricValue(*best_result, metric) == 0) {
+            throw std::runtime_error("Impossibile trovare orientamento ottimale");
+         }
+
+         // Salva i risultati
+         optimal_result = *best_result;
+         optimal_angle = best_result->angle;
+         has_optimal_result = true;
+
+         std::cout << "\n=== RISULTATO OTTIMALE (GPU Batch) ===" << std::endl;
+         std::cout << "Angolo ottimale: " << optimal_angle << "°" << std::endl;
+         std::cout << "Valore metrica: " << getMetricValue(*best_result, metric) << std::endl;
+
+         return all_results;
+
+      }
+      catch (const cv::Exception& e) {
+         std::cerr << "Errore GPU: " << e.what() << std::endl;
+         std::cout << "Fallback su metodo CPU standard" << std::endl;
+         return findOptimalOrientation(metric);
       }
    }
 
@@ -683,6 +1127,13 @@ public:
       try {
          std::cout << "=== ANALISI LENTE BI-MIRROR (Versione Parallela con OpenMP) ===" << std::endl;
 
+         static bool opencv_optimized = false;
+         if (!opencv_optimized) {
+            std::cout << "\n-1. Inizializzazione ottimizzazioni OpenCV..." << std::endl;
+            enableOpenCVOptimizations();
+            opencv_optimized = true;
+         }
+
          std::cout << "\n0. Inizializzazione LUT trigonometrica..." << std::endl;
          initializeTrigonometry();
 
@@ -696,8 +1147,15 @@ public:
             << lens_center_global.y << ")" << std::endl;
          std::cout << "     - Raggio: " << lens_radius << std::endl;
 
-         std::cout << "\n2. Ricerca orientamento ottimale (parallela)..." << std::endl;
-         std::vector<IntegralResult> results = findOptimalOrientation(metric);
+         std::vector<IntegralResult> results;
+
+         // Usa il metodo GPU batch se disponibile
+         if (cv::ocl::useOpenCL()) {
+            results = findOptimalOrientationBatchGPU(metric);
+         }
+         else {
+            results = findOptimalOrientation(metric);
+         }
 
          std::cout << "\n3. Calcolo asse centrale ottimale..." << std::endl;
          calculateOptimalCentralAxis();
@@ -1129,6 +1587,7 @@ public:
       return result;
    }
 };
+
 
 int main(int argc, char** argv) {
    try {
