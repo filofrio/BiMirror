@@ -387,14 +387,14 @@ public:
 
          cv::cvtColor(original_image, processed_image, cv::COLOR_BGR2GRAY);
 
-         //roiLente.x = 250;
-         //roiLente.y = 50;
-         //roiLente.width = 700;
-         //roiLente.height = 600;
-         roiLente.x = 50;
-         roiLente.y = 10;
-         roiLente.width = 7000;
-         roiLente.height = 6000;
+         roiLente.x = 250;
+         roiLente.y = 50;
+         roiLente.width = 700;
+         roiLente.height = 600;
+         //roiLente.x = 50;
+         //roiLente.y = 10;
+         //roiLente.width = 7000;
+         //roiLente.height = 6000;
 
          if(roiLente.x + roiLente.width > processed_image.cols)
 				roiLente.width = processed_image.cols - roiLente.x - 1;
@@ -416,13 +416,13 @@ public:
    void detectLens() {
       try {
          cv::Mat blurred;
-         //cv::GaussianBlur(roi_image, blurred, cv::Size(9, 9), 2);
+         cv::GaussianBlur(roi_image, blurred, cv::Size(9, 9), 2); // ho scoperto che ci vuole...basta uno spot di rumore per far fallire i gradienti per i circle di Hough
 
          std::vector<cv::Vec3f> circles;
-         //cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1,
-         cv::HoughCircles(roi_image, circles, cv::HOUGH_GRADIENT, 1,
+         cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1,
+         //cv::HoughCircles(roi_image, circles, cv::HOUGH_GRADIENT, 1,
             roi_image.rows / 4,
-				60, 30,     // 50, 5 era prima         50,11       50,12    primo par e' la soglia superiore di Canny, secondo par la sensibilita' per i contorni ... piu' basso maggior sensibilita'
+				30, 30,     // 50, 5 era prima         50,11       50,12    primo par e' la soglia superiore di Canny, secondo par la sensibilita' per i contorni ... piu' basso maggior sensibilita'
             roi_image.rows / 4,
             roi_image.rows / 2);
 
@@ -1596,8 +1596,8 @@ int main(int argc, char** argv) {
        omp_set_num_threads(6); // Forza 4 thread se necessario
 #endif
 
-      //std::string nomeFileImg = "imgBiDeg.png";
-      std::string nomeFileImg = "Bi_IRconFiltro.png";
+      std::string nomeFileImg = "imgBiDeg.png";
+      //std::string nomeFileImg = "Bi_IRconFiltro.png";
       BiMirrorLensAnalyzer::EvaluationMetric metrica = BiMirrorLensAnalyzer::EvaluationMetric::INTEGRAL_VALUE;
 
       // Parsing argomenti
